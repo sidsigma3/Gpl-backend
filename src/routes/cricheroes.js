@@ -75,7 +75,9 @@ router.get('/matches/:id/details', async (req, res) => {
 
     throw new Error('Failed to fetch details from scraper');
   } catch (error) {
-    res.status(500).json({ success: false, data: null, error: error.message });
+    const errorDetail = error.response?.data?.detail || error.message;
+    console.error('Match Details Error:', errorDetail);
+    res.status(500).json({ success: false, data: null, error: errorDetail });
   }
 });
 
@@ -98,6 +100,60 @@ router.get('/leaderboard', async (req, res) => {
     res.json({ success: true, data: data.data, error: null });
   } catch (error) {
     res.status(500).json({ success: false, data: null, error: error.message });
+  }
+});
+
+// Vote for Man of the Match
+router.post('/matches/:id/vote', async (req, res) => {
+  try {
+    const { playerId, playerName, voterId } = req.body;
+    const matchId = req.params.id;
+    const sessionId = voterId || req.ip; // Fallback to IP if voterId is missing
+
+    const { error } = await supabase
+      .from('fan_votes')
+      .upsert([{ 
+        match_id: matchId, 
+        player_id: playerId, 
+        player_name: playerName,
+        session_id: sessionId 
+      }], { onConflict: 'match_id, session_id' }); // One vote per person per match
+
+    if (error) {
+      console.error('Supabase Vote Error:', error);
+      throw error;
+    }
+    res.json({ success: true, message: 'Vote recorded!' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get vote counts for a match
+router.get('/matches/:id/votes', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('fan_votes')
+      .select('player_id, player_name')
+      .eq('match_id', req.params.id);
+
+    if (error) {
+      console.error('Supabase Get Votes Error:', error);
+      throw error;
+    }
+
+    // Count votes per player
+    const counts = data.reduce((acc, vote) => {
+      acc[vote.player_id] = {
+        name: vote.player_name,
+        count: (acc[vote.player_id]?.count || 0) + 1
+      };
+      return acc;
+    }, {});
+
+    res.json({ success: true, data: Object.values(counts).sort((a, b) => b.count - a.count) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 

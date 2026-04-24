@@ -38,14 +38,52 @@ export const syncData = async () => {
 
     // 3. Update Cache Tables
     if (matches?.length) {
+      const timestamp = new Date().toISOString();
       const matchData = matches.map(m => ({
         id: m.match_id || m.id,
         data: m,
         synced_at: timestamp
       }));
-      const { error: matchError } = await supabase.from('ch_matches_cache').upsert(matchData);
-      if (matchError) console.error('Match Upsert Error:', matchError);
-      else console.log(`Upserted ${matchData.length} matches.`);
+      await supabase.from('ch_matches_cache').upsert(matchData);
+      console.log(`Upserted ${matchData.length} matches.`);
+
+      // 4. DEEP SYNC: Fetch details for each match (especially past ones)
+      console.log('Starting Deep Sync for match details...');
+      for (const m of matches) {
+        const matchId = m.match_id || m.id;
+        
+        // Check if we already have detailed cache for past matches to save resources
+        if (m.match_status === 'past') {
+          const { data: existing } = await supabase.from('ch_match_details_cache').select('id').eq('id', matchId).single();
+          if (existing) continue; // Skip if already cached
+        }
+
+        try {
+          console.log(`Deep Syncing Match: ${matchId}`);
+          const team_slug = m.team_a_name && m.team_b_name ? `${m.team_a_name}-vs-${m.team_b_name}` : slug;
+          
+          const detailRes = await axios.get(`${SCRAPER_URL}/scrape/match/${matchId}`, {
+            params: { 
+              slug,
+              team_a: m.team_a_name || m.team_a,
+              team_b: m.team_b_name || m.team_b
+            },
+            headers: { 'x-sync-secret': SYNC_SECRET }
+          });
+
+          if (detailRes.data.success) {
+            await supabase.from('ch_match_details_cache').upsert([{
+              id: matchId,
+              data: detailRes.data.details,
+              synced_at: timestamp
+            }]);
+          }
+          // Small delay to be polite to CricHeroes
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (err) {
+          console.error(`Failed to deep sync match ${matchId}:`, err.message);
+        }
+      }
     }
 
     if (teams?.length) {
