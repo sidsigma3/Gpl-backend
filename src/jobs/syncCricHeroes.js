@@ -123,3 +123,6 @@ export const syncData = async () => {
 
 // Schedule: Every 15 minutes
 cron.schedule('*/15 * * * *', syncData);
+
+// Run immediately on start
+syncData();
