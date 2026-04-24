@@ -1,0 +1,87 @@
+import cron from 'node-cron';
+import axios from 'axios';
+import { supabase } from '../lib/supabase.js';
+
+const SCRAPER_URL = process.env.SCRAPER_SERVICE_URL;
+const SYNC_SECRET = process.env.ADMIN_TOKEN;
+
+export const syncData = async () => {
+  try {
+    console.log('Starting CricHeroes sync via Next.js API...');
+    
+    // 1. Get current tournament settings
+    const { data: settings, error: settingsError } = await supabase
+      .from('tournament_settings')
+      .select('*')
+      .single();
+
+    if (settingsError || !settings?.cricheroes_id) {
+      console.error('Sync failed: No tournament configuration found in Supabase');
+      return;
+    }
+
+    // Prepare slug (use hardcoded fallback if name isn't a slug)
+    const slug = settings.cricheroes_id === '1499216' 
+      ? 'govindaplly-premier-leauge-2' 
+      : settings.name?.toLowerCase().replace(/ /g, '-');
+
+    // 2. Call Python Scraper
+    const response = await axios.get(`${SCRAPER_URL}/scrape/${settings.cricheroes_id}`, {
+      params: { slug },
+      headers: { 'x-sync-secret': SYNC_SECRET }
+    });
+
+    const { matches, teams, standings, leaderboard } = response.data;
+    const timestamp = new Date().toISOString();
+
+    console.log(`Scraped: ${matches?.length || 0} matches, ${teams?.length || 0} teams.`);
+
+    // 3. Update Cache Tables
+    if (matches?.length) {
+      const matchData = matches.map(m => ({
+        id: m.match_id || m.id,
+        data: m,
+        synced_at: timestamp
+      }));
+      const { error: matchError } = await supabase.from('ch_matches_cache').upsert(matchData);
+      if (matchError) console.error('Match Upsert Error:', matchError);
+      else console.log(`Upserted ${matchData.length} matches.`);
+    }
+
+    if (teams?.length) {
+      const teamData = teams.map(t => ({
+        id: t.team_id || t.id,
+        data: t,
+        synced_at: timestamp
+      }));
+      const { error: teamError } = await supabase.from('ch_teams_cache').upsert(teamData);
+      if (teamError) console.error('Team Upsert Error:', teamError);
+      else console.log(`Upserted ${teamData.length} teams.`);
+    }
+
+    const leaderboardData = leaderboard?.length ? leaderboard : standings;
+
+    if (leaderboardData?.length) {
+      const { error: standError } = await supabase.from('ch_leaderboard_cache').upsert([{ 
+        id: 1, 
+        data: leaderboardData, 
+        synced_at: timestamp 
+      }]);
+      if (standError) console.error('Leaderboard Upsert Error:', standError);
+      else console.log(`Upserted leaderboard (${leaderboardData.length} items).`);
+    }
+
+    console.log('Sync completed successfully at', timestamp);
+  } catch (error) {
+    if (error.response) {
+      console.error('Sync Job Error (Response):', error.response.status, error.response.data);
+    } else if (error.request) {
+      console.error('Sync Job Error (No Response): Scraper might be down at', SCRAPER_URL);
+    } else {
+      console.error('Sync Job Error (Setup):', error.message);
+    }
+  }
+};
+
+// Schedule: Every 15 minutes
+cron.schedule('*/15 * * * *', syncData);
