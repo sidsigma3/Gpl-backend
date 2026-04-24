@@ -22,11 +22,11 @@ router.get('/matches', async (req, res) => {
 // Get match details (full scorecard)
 router.get('/matches/:id/details', async (req, res) => {
   try {
-    // 1. Check cache first
-    const { data: cacheData, error: cacheError } = await supabase
+    // 1. Check cache first (Try both 'id' and 'match_id' columns)
+    const { data: cacheData } = await supabase
       .from('ch_match_details_cache')
       .select('*')
-      .eq('id', req.params.id)
+      .or(`id.eq.${req.params.id},match_id.eq.${req.params.id}`)
       .single();
 
     if (cacheData && !req.query.refresh) {
@@ -77,6 +77,17 @@ router.get('/matches/:id/details', async (req, res) => {
   } catch (error) {
     const errorDetail = error.response?.data?.detail || error.message;
     console.error('Match Details Error:', errorDetail);
+
+    // Friendly error for IP blocks
+    if (errorDetail.includes('build ID')) {
+      return res.status(200).json({ 
+        success: false, 
+        data: null, 
+        error: "Sync Required: Live updates are blocked by CricHeroes for this match. Please run a 'Deep Sync' locally to refresh data.",
+        isBlocked: true 
+      });
+    }
+
     res.status(500).json({ success: false, data: null, error: errorDetail });
   }
 });
