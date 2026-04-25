@@ -22,7 +22,7 @@ router.get('/matches', async (req, res) => {
 // Get match details (full scorecard)
 router.get('/matches/:id/details', async (req, res) => {
   try {
-    // 1. Check cache first
+    // 1. Strictly read from database cache ONLY
     const { data: cacheData, error: cacheError } = await supabase
       .from('ch_match_details_cache')
       .select('*')
@@ -31,68 +31,25 @@ router.get('/matches/:id/details', async (req, res) => {
 
     if (cacheError && cacheError.code !== 'PGRST116') {
       console.error('Supabase Cache Lookup Error:', cacheError);
+      throw cacheError;
     }
 
-    if (cacheData && !req.query.refresh) {
+    if (cacheData && cacheData.data) {
       return res.json({ success: true, data: cacheData.data, error: null });
     }
 
-    // 2. Not in cache or refresh requested, fetch from match cache to get teams
-    const { data: match, error: matchError } = await supabase
-      .from('ch_matches_cache')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
-
-    if (matchError || !match) throw new Error('Match not found');
-
-    const m = match.data;
-    const { data: settings } = await supabase.from('tournament_settings').select('*').single();
-    const slug = settings.cricheroes_id === '1499216' 
-      ? 'govindaplly-premier-leauge-2' 
-      : settings.name?.toLowerCase().replace(/ /g, '-');
-
-    // 3. Fetch from scraper
-    const SCRAPER_URL = process.env.SCRAPER_SERVICE_URL || 'http://localhost:8000';
-    const SYNC_SECRET = process.env.ADMIN_TOKEN;
-
-    const response = await axios.get(`${SCRAPER_URL}/scrape/match/${req.params.id}`, {
-      params: { 
-        slug,
-        team_a: m.team_a,
-        team_b: m.team_b
-      },
-      headers: { 'x-sync-secret': SYNC_SECRET }
+    // 2. If data is not in the database, return an error. 
+    // WE WILL NOT TRY TO SCRAPE LIVE TO AVOID RENDERS IP BLOCKS.
+    return res.status(200).json({ 
+      success: false, 
+      data: null, 
+      error: "Sync Required: This match scorecard has not been synced to the database yet. Please run the sync job locally.",
+      isBlocked: true 
     });
 
-    if (response.data.success) {
-      const details = response.data.details;
-      // 4. Cache it
-      await supabase.from('ch_match_details_cache').upsert([{
-        id: req.params.id,
-        data: details,
-        synced_at: new Date().toISOString()
-      }]);
-
-      return res.json({ success: true, data: details, error: null });
-    }
-
-    throw new Error('Failed to fetch details from scraper');
   } catch (error) {
-    const errorDetail = error.response?.data?.detail || error.message;
-    console.error('Match Details Error:', errorDetail);
-
-    // Friendly error for IP blocks
-    if (errorDetail.includes('build ID')) {
-      return res.status(200).json({ 
-        success: false, 
-        data: null, 
-        error: "Sync Required: Live updates are blocked by CricHeroes for this match. Please run a 'Deep Sync' locally to refresh data.",
-        isBlocked: true 
-      });
-    }
-
-    res.status(500).json({ success: false, data: null, error: errorDetail });
+    console.error('Match Details Error:', error.message);
+    res.status(500).json({ success: false, data: null, error: error.message });
   }
 });
 
