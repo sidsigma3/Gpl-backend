@@ -23,15 +23,21 @@ router.get('/matches', async (req, res) => {
 router.get('/matches/:id/details', async (req, res) => {
   try {
     // 1. Strictly read from database cache ONLY
+    const tableName = 'ch_match_details_cache';
     const { data: cacheData, error: cacheError } = await supabase
-      .from('ch_match_details_cache')
+      .from(tableName)
       .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
-    if (cacheError && cacheError.code !== 'PGRST116') {
-      console.error('Supabase Cache Lookup Error:', cacheError);
-      throw cacheError;
+    if (cacheError) {
+      // If table is missing from cache, it might be a Supabase sync issue
+      if (cacheError.message?.includes('schema cache')) {
+        console.error('CRITICAL: Supabase cannot find the table. Please check if ch_match_details_cache exists in your SQL editor.');
+      }
+      if (cacheError.code !== 'PGRST116') {
+        console.error(`Supabase Lookup Error [${tableName}]:`, cacheError.message);
+      }
     }
 
     if (cacheData && cacheData.data) {

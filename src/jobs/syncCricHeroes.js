@@ -35,7 +35,7 @@ export const syncData = async () => {
     const timestamp = new Date().toISOString();
 
     console.log(`Scraped: ${matches?.length || 0} matches, ${teams?.length || 0} teams.`);
-
+    
     // 3. Update Cache Tables
     if (matches?.length) {
       const timestamp = new Date().toISOString();
@@ -52,10 +52,16 @@ export const syncData = async () => {
       for (const m of matches) {
         const matchId = m.match_id || m.id;
         
-        // Check if we already have detailed cache for past matches to save resources
-        if (m.match_status === 'past') {
-          const { data: existing } = await supabase.from('ch_match_details_cache').select('id').eq('id', matchId).single();
-          if (existing) continue; // Skip if already cached
+        // Check if we already have detailed cache to save resources (Sync Once logic)
+        const { data: existing } = await supabase
+          .from('ch_match_details_cache')
+          .select('id')
+          .eq('id', matchId)
+          .maybeSingle();
+          
+        if (existing) {
+          console.log(`⏩ Skipping already cached match: ${matchId}`);
+          continue; 
         }
 
         try {
@@ -72,11 +78,19 @@ export const syncData = async () => {
           });
 
           if (detailRes.data.success) {
-            await supabase.from('ch_match_details_cache').upsert([{
+            const { error: upsertError } = await supabase.from('ch_match_details_cache').upsert([{
               id: matchId,
               data: detailRes.data.details,
               synced_at: timestamp
             }]);
+            
+            if (upsertError) {
+              console.error(`❌ Database Error for match ${matchId}:`, upsertError.message);
+            } else {
+              console.log(`✅ Upserted scorecard for match ${matchId}`);
+            }
+          } else {
+            console.error(`❌ Scraper failed for match ${matchId}: ${detailRes.data.error || 'Unknown error'}`);
           }
           // Small delay to be polite to CricHeroes
           await new Promise(resolve => setTimeout(resolve, 2000));
