@@ -7,136 +7,162 @@ const SYNC_SECRET = process.env.ADMIN_TOKEN;
 
 export const syncData = async () => {
   try {
-    console.log('Starting CricHeroes sync via Next.js API...');
+    console.log('--- STARTING MULTI-TOURNAMENT SYNC ---');
     
-    // 1. Get current tournament settings
-    const { data: settings, error: settingsError } = await supabase
-      .from('tournament_settings')
+    // 1. Get all active tournaments from the new table
+    const { data: tournaments, error: tourneyError } = await supabase
+      .from('tournaments')
       .select('*')
-      .single();
+      .eq('is_active', true);
 
-    if (settingsError || !settings?.cricheroes_id) {
-      console.error('Sync failed: No tournament configuration found in Supabase');
+    if (tourneyError) {
+      console.error('Failed to fetch tournaments:', tourneyError.message);
       return;
     }
 
-    // Prepare slug (use hardcoded fallback if name isn't a slug)
-    const slug = settings.cricheroes_id === '1499216' 
-      ? 'govindaplly-premier-leauge-2' 
-      : settings.name?.toLowerCase().replace(/ /g, '-');
+    if (!tournaments || tournaments.length === 0) {
+      console.log('No active tournaments found to sync.');
+      return;
+    }
 
-    // 2. Call Python Scraper
-    const response = await axios.get(`${SCRAPER_URL}/scrape/${settings.cricheroes_id}`, {
-      params: { slug },
-      headers: { 'x-sync-secret': SYNC_SECRET }
-    });
+    for (const tournament of tournaments) {
+      console.log(`\n🔄 Syncing Tournament: ${tournament.name} (${tournament.api_tournament_id})`);
+      
+      const cricheroesId = tournament.api_tournament_id;
+      // Generate slug from name
+      const slug = tournament.name.toLowerCase().replace(/ /g, '-').replace(/[^\w-]/g, '');
 
-    const { matches, teams, standings, leaderboard } = response.data;
-    const timestamp = new Date().toISOString();
+      // 2. Call Python Scraper
+      try {
+        const response = await axios.get(`${SCRAPER_URL}/scrape/${cricheroesId}`, {
+          params: { slug },
+          headers: { 'x-sync-secret': SYNC_SECRET }
+        });
 
-    console.log(`Scraped: ${matches?.length || 0} matches, ${teams?.length || 0} teams.`);
-    
-    // 3. Update Cache Tables
-    if (matches?.length) {
-      const timestamp = new Date().toISOString();
-      const matchData = matches.map(m => ({
-        id: m.match_id || m.id,
-        data: m,
-        synced_at: timestamp
-      }));
-      await supabase.from('ch_matches_cache').upsert(matchData);
-      console.log(`Upserted ${matchData.length} matches.`);
+        const { matches, teams, standings, leaderboard } = response.data;
+        const timestamp = new Date().toISOString();
 
-      // 4. DEEP SYNC: Fetch details for each match (especially past ones)
-      console.log('Starting Deep Sync for match details...');
-      for (const m of matches) {
-        const matchId = m.match_id || m.id;
+        console.log(`Scraped ${tournament.name}: ${matches?.length || 0} matches, ${teams?.length || 0} teams.`);
         
-        // Check if we already have detailed cache to save resources (Sync Once logic)
-        const { data: existing } = await supabase
-          .from('ch_match_details_cache')
-          .select('id')
-          .eq('id', matchId)
-          .maybeSingle();
-          
-        if (existing) {
-          console.log(`⏩ Skipping already cached match: ${matchId}`);
-          continue; 
-        }
+        // 3. Update Cache Tables with tournament_id
+        if (matches?.length) {
+          const matchData = matches.map(m => ({
+            id: m.match_id || m.id,
+            data: m,
+            synced_at: timestamp,
+            tournament_id: tournament.id
+          }));
+          await supabase.from('ch_matches_cache').upsert(matchData);
+          console.log(`✅ Upserted ${matchData.length} matches for ${tournament.name}.`);
 
-        try {
-          console.log(`Deep Syncing Match: ${matchId}`);
-          const team_slug = m.team_a_name && m.team_b_name ? `${m.team_a_name}-vs-${m.team_b_name}` : slug;
-          
-          const detailRes = await axios.get(`${SCRAPER_URL}/scrape/match/${matchId}`, {
-            params: { 
-              slug,
-              team_a: m.team_a_name || m.team_a,
-              team_b: m.team_b_name || m.team_b
-            },
-            headers: { 'x-sync-secret': SYNC_SECRET }
-          });
-
-          if (detailRes.data.success) {
-            const { error: upsertError } = await supabase.from('ch_match_details_cache').upsert([{
-              id: matchId,
-              data: detailRes.data.details,
-              synced_at: timestamp
-            }]);
+          // 4. DEEP SYNC: Match details
+          for (const m of matches) {
+            const matchId = m.match_id || m.id;
             
-            if (upsertError) {
-              console.error(`❌ Database Error for match ${matchId}:`, upsertError.message);
-            } else {
-              console.log(`✅ Upserted scorecard for match ${matchId}`);
+            // Skip deep sync for upcoming matches to avoid scraper errors
+            if (m.status === 'upcoming') {
+              // console.log(`   └─ Skipping upcoming match: ${matchId}`);
+              continue;
             }
-          } else {
-            console.error(`❌ Scraper failed for match ${matchId}: ${detailRes.data.error || 'Unknown error'}`);
+
+            const { data: existing } = await supabase
+              .from('ch_match_details_cache')
+              .select('id')
+              .eq('id', matchId)
+              .maybeSingle();
+              
+            if (existing) continue; 
+
+            try {
+              const detailRes = await axios.get(`${SCRAPER_URL}/scrape/match/${matchId}`, {
+                params: { slug, team_a: m.team_a_name || m.team_a, team_b: m.team_b_name || m.team_b },
+                headers: { 'x-sync-secret': SYNC_SECRET }
+              });
+
+              if (detailRes.data.success) {
+                await supabase.from('ch_match_details_cache').upsert([{
+                  id: matchId,
+                  data: detailRes.data.details,
+                  synced_at: timestamp,
+                  tournament_id: tournament.id
+                }]);
+                console.log(`   └─ Cached scorecard: ${matchId}`);
+              }
+              await new Promise(resolve => setTimeout(resolve, 1500));
+            } catch (err) {
+              console.error(`   └─ Failed match ${matchId}:`, err.message);
+            }
           }
-          // Small delay to be polite to CricHeroes
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        } catch (err) {
-          console.error(`Failed to deep sync match ${matchId}:`, err.message);
         }
+
+        if (teams?.length) {
+          for (const t of teams) {
+            const teamId = t.team_id || t.id;
+            
+            // Fetch existing data to preserve players if needed
+            const { data: existing } = await supabase
+              .from('ch_teams_cache')
+              .select('data')
+              .eq('id', teamId)
+              .maybeSingle();
+
+            let finalData = t;
+            // If existing has more players (e.g. from PDF import), keep them
+            if (existing?.data?.players?.length > (t.players?.length || 0)) {
+               finalData = { ...t, players: existing.data.players };
+            }
+
+            await supabase.from('ch_teams_cache').upsert([{
+              id: teamId,
+              data: finalData,
+              synced_at: timestamp,
+              tournament_id: tournament.id
+            }]);
+          }
+          console.log(`✅ Upserted ${teams.length} teams for ${tournament.name}.`);
+        }
+
+        const leaderboardData = leaderboard?.length ? leaderboard : standings;
+        if (leaderboardData?.length) {
+          // Find existing leaderboard for this tournament
+          const { data: existing } = await supabase
+            .from('ch_leaderboard_cache')
+            .select('id')
+            .eq('tournament_id', tournament.id)
+            .maybeSingle();
+
+          if (existing) {
+            // Update existing
+            await supabase.from('ch_leaderboard_cache')
+              .update({ 
+                data: leaderboardData, 
+                synced_at: timestamp 
+              })
+              .eq('id', existing.id);
+          } else {
+            // Insert new
+            await supabase.from('ch_leaderboard_cache').insert([{ 
+              data: leaderboardData, 
+              synced_at: timestamp,
+              tournament_id: tournament.id
+            }]);
+          }
+          console.log(`✅ Upserted leaderboard for ${tournament.name}.`);
+        }
+
+      } catch (err) {
+        console.error(`❌ Sync failed for ${tournament.name}:`, err.message);
       }
     }
 
-    if (teams?.length) {
-      const teamData = teams.map(t => ({
-        id: t.team_id || t.id,
-        data: t,
-        synced_at: timestamp
-      }));
-      const { error: teamError } = await supabase.from('ch_teams_cache').upsert(teamData);
-      if (teamError) console.error('Team Upsert Error:', teamError);
-      else console.log(`Upserted ${teamData.length} teams.`);
-    }
-
-    const leaderboardData = leaderboard?.length ? leaderboard : standings;
-
-    if (leaderboardData?.length) {
-      const { error: standError } = await supabase.from('ch_leaderboard_cache').upsert([{ 
-        id: 1, 
-        data: leaderboardData, 
-        synced_at: timestamp 
-      }]);
-      if (standError) console.error('Leaderboard Upsert Error:', standError);
-      else console.log(`Upserted leaderboard (${leaderboardData.length} items).`);
-    }
-
-    console.log('Sync completed successfully at', timestamp);
+    console.log('\n--- ALL SYNC JOBS COMPLETE ---');
   } catch (error) {
-    if (error.response) {
-      console.error('Sync Job Error (Response):', error.response.status, error.response.data);
-    } else if (error.request) {
-      console.error('Sync Job Error (No Response): Scraper might be down at', SCRAPER_URL);
-    } else {
-      console.error('Sync Job Error (Setup):', error.message);
-    }
+    console.error('Critical Sync Error:', error.message);
   }
 };
 
-// Schedule: Every 15 minutes
-cron.schedule('*/15 * * * *', syncData);
+// Schedule: Every 30 minutes
+cron.schedule('*/30 * * * *', syncData);
 
 // Run immediately on start
 syncData();

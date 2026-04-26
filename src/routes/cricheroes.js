@@ -7,10 +7,17 @@ const router = express.Router();
 // Get all matches (Live + Past)
 router.get('/matches', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { tournamentId } = req.query;
+    let query = supabase
       .from('ch_matches_cache')
       .select('*')
       .order('synced_at', { ascending: false });
+
+    if (tournamentId) {
+      query = query.eq('tournament_id', tournamentId);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
     res.json({ success: true, data, error: null });
@@ -62,7 +69,14 @@ router.get('/matches/:id/details', async (req, res) => {
 // Get teams
 router.get('/teams', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('ch_teams_cache').select('*');
+    const { tournamentId } = req.query;
+    let query = supabase.from('ch_teams_cache').select('*');
+    
+    if (tournamentId) {
+      query = query.eq('tournament_id', tournamentId);
+    }
+
+    const { data, error } = await query;
     if (error) throw error;
     res.json({ success: true, data, error: null });
   } catch (error) {
@@ -73,8 +87,23 @@ router.get('/teams', async (req, res) => {
 // Get leaderboard
 router.get('/leaderboard', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('ch_leaderboard_cache').select('*').single();
+    const { tournamentId } = req.query;
+    let query = supabase.from('ch_leaderboard_cache').select('*');
+    
+    if (tournamentId) {
+      query = query.eq('tournament_id', tournamentId);
+    } else {
+      // Default to the most recently synced leaderboard
+      query = query.order('synced_at', { ascending: false }).limit(1);
+    }
+
+    const { data, error } = await query.maybeSingle();
+    
     if (error) throw error;
+    if (!data) {
+      return res.json({ success: true, data: [], message: 'No leaderboard data found for this season.' });
+    }
+    
     res.json({ success: true, data: data.data, error: null });
   } catch (error) {
     res.status(500).json({ success: false, data: null, error: error.message });
@@ -189,6 +218,21 @@ router.get('/matches/:id/highlights', async (req, res) => {
     res.json({ success: true, data: generatedText });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get all tournaments
+router.get('/tournaments', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tournaments')
+      .select('*')
+      .order('year', { ascending: false });
+
+    if (error) throw error;
+    res.json({ success: true, data, error: null });
+  } catch (error) {
+    res.status(500).json({ success: false, data: null, error: error.message });
   }
 });
 
