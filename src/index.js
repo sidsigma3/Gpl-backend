@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import cricheroesRouter from './routes/cricheroes.js';
 import adminRouter from './routes/admin.js';
+import aiRouter from './routes/ai.js';
 
 dotenv.config();
 
@@ -18,6 +19,7 @@ app.use(express.json());
 
 app.use('/api', cricheroesRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/ai', aiRouter);
 
 app.get('/health', (req, res) => {
   res.json({ success: true, data: { status: 'ok' }, error: null });

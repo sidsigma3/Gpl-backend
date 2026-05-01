@@ -227,6 +227,7 @@ router.get('/tournaments', async (req, res) => {
     const { data, error } = await supabase
       .from('tournaments')
       .select('*')
+      .eq('is_active', true)
       .order('year', { ascending: false });
 
     if (error) throw error;
