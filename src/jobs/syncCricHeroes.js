@@ -99,22 +99,9 @@ export const syncData = async () => {
           for (const t of teams) {
             const teamId = t.team_id || t.id;
             
-            // Fetch existing data to preserve players if needed
-            const { data: existing } = await supabase
-              .from('ch_teams_cache')
-              .select('data')
-              .eq('id', teamId)
-              .maybeSingle();
-
-            let finalData = t;
-            // If existing has more players (e.g. from PDF import), keep them
-            if (existing?.data?.players?.length > (t.players?.length || 0)) {
-               finalData = { ...t, players: existing.data.players };
-            }
-
             await supabase.from('ch_teams_cache').upsert([{
               id: teamId,
-              data: finalData,
+              data: t,
               synced_at: timestamp,
               tournament_id: tournament.id
             }]);
