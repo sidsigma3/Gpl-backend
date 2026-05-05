@@ -29,7 +29,6 @@ router.get('/matches', async (req, res) => {
 // Get match details (full scorecard)
 router.get('/matches/:id/details', async (req, res) => {
   try {
-    // 1. Strictly read from database cache ONLY
     const tableName = 'ch_match_details_cache';
     const { data: cacheData, error: cacheError } = await supabase
       .from(tableName)
@@ -37,12 +36,10 @@ router.get('/matches/:id/details', async (req, res) => {
       .eq('id', req.params.id)
       .maybeSingle();
 
-    if (cacheError) {
-      // If table is missing from cache, it might be a Supabase sync issue
+    if (cacheError && cacheError.code !== 'PGRST116') {
       if (cacheError.message?.includes('schema cache')) {
-        console.error('CRITICAL: Supabase cannot find the table. Please check if ch_match_details_cache exists in your SQL editor.');
-      }
-      if (cacheError.code !== 'PGRST116') {
+        console.error('CRITICAL: Supabase cannot find ch_match_details_cache.');
+      } else {
         console.error(`Supabase Lookup Error [${tableName}]:`, cacheError.message);
       }
     }
@@ -51,13 +48,55 @@ router.get('/matches/:id/details', async (req, res) => {
       return res.json({ success: true, data: cacheData.data, error: null });
     }
 
-    // 2. If data is not in the database, return an error. 
-    // WE WILL NOT TRY TO SCRAPE LIVE TO AVOID RENDERS IP BLOCKS.
-    return res.status(200).json({ 
-      success: false, 
-      data: null, 
-      error: "Sync Required: This match scorecard has not been synced to the database yet. Please run the sync job locally.",
-      isBlocked: true 
+    // Cache miss — fall back to our own scraper service (not CricHeroes direct,
+    // so no IP-ban risk). Common case: match just went live and the 1-min cron
+    // hasn't seen it yet, or it was upcoming during the last full sync.
+    const { data: matchRow } = await supabase
+      .from('ch_matches_cache')
+      .select('*, tournament:tournaments(*)')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (!matchRow || !matchRow.tournament) {
+      return res.status(200).json({
+        success: false,
+        data: null,
+        error: 'Match not found. Run a full sync to populate.',
+      });
+    }
+
+    const slug = matchRow.tournament.name.toLowerCase().replace(/ /g, '-').replace(/[^\w-]/g, '');
+    const teamA = matchRow.data.team_a_name || matchRow.data.team_a;
+    const teamB = matchRow.data.team_b_name || matchRow.data.team_b;
+
+    try {
+      const scraperRes = await axios.get(
+        `${process.env.SCRAPER_SERVICE_URL}/scrape/match/${req.params.id}`,
+        {
+          params: { slug, team_a: teamA, team_b: teamB },
+          headers: { 'x-sync-secret': process.env.ADMIN_TOKEN },
+          timeout: 20000,
+        }
+      );
+
+      if (scraperRes.data?.success) {
+        const details = scraperRes.data.details;
+        await supabase.from('ch_match_details_cache').upsert([{
+          id: req.params.id,
+          data: details,
+          synced_at: new Date().toISOString(),
+          tournament_id: matchRow.tournament_id,
+        }]);
+        return res.json({ success: true, data: details, error: null });
+      }
+    } catch (err) {
+      console.error('On-demand match scrape failed:', err.message);
+    }
+
+    return res.status(200).json({
+      success: false,
+      data: null,
+      error: 'Match scorecard temporarily unavailable. Try again shortly.',
     });
 
   } catch (error) {
