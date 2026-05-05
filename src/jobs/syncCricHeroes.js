@@ -59,19 +59,8 @@ export const syncData = async () => {
           for (const m of matches) {
             const matchId = m.match_id || m.id;
             
-            // Skip deep sync for upcoming matches to avoid scraper errors
-            if (m.status === 'upcoming') {
-              // console.log(`   └─ Skipping upcoming match: ${matchId}`);
-              continue;
-            }
-
-            const { data: existing } = await supabase
-              .from('ch_match_details_cache')
-              .select('id')
-              .eq('id', matchId)
-              .maybeSingle();
-              
-            if (existing) continue; 
+            // Skip deep sync for upcoming matches — no scorecard exists yet
+            if (m.status === 'upcoming') continue;
 
             try {
               const detailRes = await axios.get(`${SCRAPER_URL}/scrape/match/${matchId}`, {
@@ -148,8 +137,78 @@ export const syncData = async () => {
   }
 };
 
-// Schedule: Every 30 minutes
+// Lightweight pass: refresh only currently-live matches, every 2 minutes.
+// Hits the dedicated /scrape/live/{tournament_id} scraper endpoint which only
+// fetches the live-matches tab (1 request) — cheap on Render free tier.
+export const syncLiveMatches = async () => {
+  try {
+    const { data: tournaments, error: tourneyError } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('is_active', true);
+
+    if (tourneyError || !tournaments?.length) return;
+
+    for (const tournament of tournaments) {
+      const slug = tournament.name.toLowerCase().replace(/ /g, '-').replace(/[^\w-]/g, '');
+
+      try {
+        const liveRes = await axios.get(
+          `${SCRAPER_URL}/scrape/live/${tournament.api_tournament_id}`,
+          { params: { slug }, headers: { 'x-sync-secret': SYNC_SECRET }, timeout: 15000 }
+        );
+
+        const liveMatches = liveRes.data?.matches || [];
+        if (!liveMatches.length) continue;
+
+        const timestamp = new Date().toISOString();
+        console.log(`⚡ Live sync ${tournament.name}: ${liveMatches.length} live match(es)`);
+
+        // Refresh ch_matches_cache rows for these live matches (so list views see fresh scores)
+        await supabase.from('ch_matches_cache').upsert(
+          liveMatches.map(m => ({
+            id: m.match_id || m.id,
+            data: m,
+            synced_at: timestamp,
+            tournament_id: tournament.id,
+          }))
+        );
+
+        // Refresh the full scorecard for each live match
+        for (const m of liveMatches) {
+          const matchId = m.match_id || m.id;
+          try {
+            const detailRes = await axios.get(`${SCRAPER_URL}/scrape/match/${matchId}`, {
+              params: { slug, team_a: m.team_a_name || m.team_a, team_b: m.team_b_name || m.team_b },
+              headers: { 'x-sync-secret': SYNC_SECRET },
+              timeout: 20000,
+            });
+            if (detailRes.data?.success) {
+              await supabase.from('ch_match_details_cache').upsert([{
+                id: matchId,
+                data: detailRes.data.details,
+                synced_at: timestamp,
+                tournament_id: tournament.id,
+              }]);
+            }
+          } catch (err) {
+            console.error(`   └─ Live detail failed ${matchId}:`, err.message);
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Live sync failed for ${tournament.name}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error('Critical Live Sync Error:', error.message);
+  }
+};
+
+// Full sync (matches + teams + leaderboard + all match scorecards): every 30 min
 cron.schedule('*/30 * * * *', syncData);
 
-// Run immediately on start
+// Live-only fast pass: every 2 min
+cron.schedule('*/2 * * * *', syncLiveMatches);
+
+// Run full sync immediately on start
 syncData();
