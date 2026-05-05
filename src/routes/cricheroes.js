@@ -44,55 +44,66 @@ router.get('/matches/:id/details', async (req, res) => {
       }
     }
 
-    if (cacheData && cacheData.data) {
+    // Decide whether the cached row is usable.
+    // - Bad shape (missing summary.summaryData.data): treat as miss so it self-heals
+    // - Live match older than 30s: refetch to keep scores fresh
+    // - Past/upcoming: serve from cache regardless of age
+    const cachedSummary = cacheData?.data?.summary?.summaryData?.data;
+    const cacheAgeMs = cacheData?.synced_at
+      ? Date.now() - new Date(cacheData.synced_at).getTime()
+      : Infinity;
+    const cacheUsable =
+      cacheData?.data &&
+      cachedSummary &&
+      (cachedSummary.status !== 'live' || cacheAgeMs < 30_000);
+
+    if (cacheUsable) {
       return res.json({ success: true, data: cacheData.data, error: null });
     }
 
-    // Cache miss — fall back to our own scraper service (not CricHeroes direct,
-    // so no IP-ban risk). Common case: match just went live and the 1-min cron
-    // hasn't seen it yet, or it was upcoming during the last full sync.
+    // Cache miss / stale-live / broken-shape — fall back to our own scraper service
+    // (not CricHeroes direct, so no IP-ban risk).
     const { data: matchRow } = await supabase
       .from('ch_matches_cache')
       .select('*, tournament:tournaments(*)')
       .eq('id', req.params.id)
       .maybeSingle();
 
-    if (!matchRow || !matchRow.tournament) {
-      return res.status(200).json({
-        success: false,
-        data: null,
-        error: 'Match not found. Run a full sync to populate.',
-      });
-    }
+    if (matchRow && matchRow.tournament) {
+      const slug = matchRow.tournament.name.toLowerCase().replace(/ /g, '-').replace(/[^\w-]/g, '');
+      const teamA = matchRow.data.team_a_name || matchRow.data.team_a;
+      const teamB = matchRow.data.team_b_name || matchRow.data.team_b;
 
-    const slug = matchRow.tournament.name.toLowerCase().replace(/ /g, '-').replace(/[^\w-]/g, '');
-    const teamA = matchRow.data.team_a_name || matchRow.data.team_a;
-    const teamB = matchRow.data.team_b_name || matchRow.data.team_b;
+      try {
+        const scraperRes = await axios.get(
+          `${process.env.SCRAPER_SERVICE_URL}/scrape/match/${req.params.id}`,
+          {
+            params: { slug, team_a: teamA, team_b: teamB },
+            headers: { 'x-sync-secret': process.env.ADMIN_TOKEN },
+            timeout: 20000,
+          }
+        );
 
-    try {
-      const scraperRes = await axios.get(
-        `${process.env.SCRAPER_SERVICE_URL}/scrape/match/${req.params.id}`,
-        {
-          params: { slug, team_a: teamA, team_b: teamB },
-          headers: { 'x-sync-secret': process.env.ADMIN_TOKEN },
-          timeout: 20000,
+        if (scraperRes.data?.success) {
+          const details = scraperRes.data.details;
+          await supabase.from('ch_match_details_cache').upsert([{
+            id: req.params.id,
+            data: details,
+            synced_at: new Date().toISOString(),
+            tournament_id: matchRow.tournament_id,
+          }]);
+          return res.json({ success: true, data: details, error: null });
         }
-      );
-
-      if (scraperRes.data?.success) {
-        const details = scraperRes.data.details;
-        await supabase.from('ch_match_details_cache').upsert([{
-          id: req.params.id,
-          data: details,
-          synced_at: new Date().toISOString(),
-          tournament_id: matchRow.tournament_id,
-        }]);
-        return res.json({ success: true, data: details, error: null });
+      } catch (err) {
+        console.error('On-demand match scrape failed:', err.message);
       }
-    } catch (err) {
-      console.error('On-demand match scrape failed:', err.message);
     }
 
+    // Scraper unavailable or no match row — return stale cache if we have anything,
+    // otherwise admit we have nothing.
+    if (cacheData?.data) {
+      return res.json({ success: true, data: cacheData.data, error: null });
+    }
     return res.status(200).json({
       success: false,
       data: null,
