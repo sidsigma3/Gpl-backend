@@ -207,8 +207,8 @@ export const syncLiveMatches = async () => {
 // Full sync (matches + teams + leaderboard + all match scorecards): every 30 min
 cron.schedule('*/30 * * * *', syncData);
 
-// Live-only fast pass: every 2 min
-cron.schedule('*/2 * * * *', syncLiveMatches);
+// Live-only fast pass: every 1 min
+cron.schedule('* * * * *', syncLiveMatches);
 
 // Run full sync immediately on start
 syncData();
