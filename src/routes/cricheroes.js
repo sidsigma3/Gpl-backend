@@ -46,7 +46,7 @@ router.get('/matches/:id/details', async (req, res) => {
 
     // Decide whether the cached row is usable.
     // - Bad shape (missing summary.summaryData.data): treat as miss so it self-heals
-    // - Live match older than 30s: refetch to keep scores fresh
+    // - Live match older than 10s: refetch to keep scores near-realtime
     // - Past/upcoming: serve from cache regardless of age
     const cachedSummary = cacheData?.data?.summary?.summaryData?.data;
     const cacheAgeMs = cacheData?.synced_at
@@ -55,7 +55,7 @@ router.get('/matches/:id/details', async (req, res) => {
     const cacheUsable =
       cacheData?.data &&
       cachedSummary &&
-      (cachedSummary.status !== 'live' || cacheAgeMs < 30_000);
+      (cachedSummary.status !== 'live' || cacheAgeMs < 10_000);
 
     if (cacheUsable) {
       return res.json({ success: true, data: cacheData.data, error: null });
