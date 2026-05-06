@@ -281,6 +281,21 @@ router.get('/stats', async (req, res) => {
     const { data: rows, error } = await query;
     if (error) throw error;
 
+    // Pull team rosters for the same tournament so we can enrich each ranked
+    // player with a profile photo. Scorecard rows on ch_match_details_cache
+    // generally do not carry profile_photo per player; the squad merge in the
+    // scraper does, and lives on ch_teams_cache.data.players.
+    let teamsQuery = supabase.from('ch_teams_cache').select('data, tournament_id');
+    if (tournamentId) teamsQuery = teamsQuery.eq('tournament_id', tournamentId);
+    const { data: teamRows } = await teamsQuery;
+    const photoByPlayerId = new Map();
+    for (const tr of teamRows || []) {
+      for (const p of tr?.data?.players || []) {
+        const pid = p?.player_id || p?.id;
+        if (pid && p?.profile_photo) photoByPlayerId.set(String(pid), p.profile_photo);
+      }
+    }
+
     const batters = new Map(); // player_id -> { name, team_id, runs, balls, fours, sixes, innings, notOuts, highest, photo }
     const bowlers = new Map(); // player_id -> { name, team_id, wickets, runs, overs (decimal), innings, photo }
 
@@ -330,11 +345,13 @@ router.get('/stats', async (req, res) => {
 
     const enrichedBatters = Array.from(batters.values()).map(b => ({
       ...b,
+      photo: b.photo || photoByPlayerId.get(String(b.player_id)) || null,
       strike_rate: b.balls > 0 ? +(b.runs / b.balls * 100).toFixed(2) : 0,
       average: (b.innings - b.not_outs) > 0 ? +(b.runs / (b.innings - b.not_outs)).toFixed(2) : null,
     }));
     const enrichedBowlers = Array.from(bowlers.values()).map(b => ({
       ...b,
+      photo: b.photo || photoByPlayerId.get(String(b.player_id)) || null,
       overs: +b.overs_decimal.toFixed(1),
       economy: b.overs_decimal > 0 ? +(b.runs / b.overs_decimal).toFixed(2) : 0,
     }));
@@ -366,6 +383,35 @@ router.get('/stats', async (req, res) => {
     });
   } catch (error) {
     console.error('Stats Error:', error.message);
+    res.status(500).json({ success: false, data: null, error: error.message });
+  }
+});
+
+// Manual match-result overrides — used for abandoned / forfeit matches where
+// the tournament committee awarded points off-field. Frontend merges these on
+// top of the cached match data when computing standings, results, etc.
+router.get('/match-overrides', async (req, res) => {
+  try {
+    const { tournamentId } = req.query;
+
+    let query = supabase.from('match_result_overrides').select('*');
+
+    if (tournamentId) {
+      // Only return overrides whose match belongs to the requested tournament.
+      // Look up the match -> tournament mapping via ch_matches_cache.
+      const { data: matchRows } = await supabase
+        .from('ch_matches_cache')
+        .select('id')
+        .eq('tournament_id', tournamentId);
+      const ids = (matchRows || []).map(r => Number(r.id)).filter(Number.isFinite);
+      if (!ids.length) return res.json({ success: true, data: [], error: null });
+      query = query.in('match_id', ids);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ success: true, data: data || [], error: null });
+  } catch (error) {
     res.status(500).json({ success: false, data: null, error: error.message });
   }
 });
