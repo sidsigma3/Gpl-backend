@@ -12,6 +12,7 @@ const callGateway = async (messages, { model, temperature = 0.4, jsonMode = fals
     model: model || PRIMARY_MODEL,
     messages,
     temperature,
+    stream: false,
     ...(maxTokens ? { max_tokens: maxTokens } : {}),
     ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
   };
@@ -22,7 +23,11 @@ const callGateway = async (messages, { model, temperature = 0.4, jsonMode = fals
     headers,
     timeout: 25_000,
   });
-  return res.data?.choices?.[0]?.message?.content || '';
+  const choice = res.data?.choices?.[0] || {};
+  const content = choice.message?.content || '';
+  const finishReason = choice.finish_reason;
+  const usedModel = res.data?.model;
+  return { content, finishReason, usedModel };
 };
 
 const safeJsonExtract = (text) => {
@@ -175,11 +180,14 @@ ${snap.status === 'past' ? `Result: ${snap.winner} won by ${snap.winBy}.` : ''}
 Respond with the commentary text only — no preamble, no markdown. 2-3 sentences.`;
 
   try {
-    const text = await callGateway(
+    const { content, finishReason, usedModel } = await callGateway(
       [{ role: 'user', content: prompt }],
       { temperature: 0.7, maxTokens: 350 },
     );
-    return text?.trim() || `${snap.teamAName} face off against ${snap.teamBName} at Govindapally — the action is heating up.`;
+    if (finishReason && finishReason !== 'stop' && finishReason !== 'length') {
+      console.warn(`Commentary finished with reason="${finishReason}" model=${usedModel} len=${content?.length}`);
+    }
+    return content?.trim() || `${snap.teamAName} face off against ${snap.teamBName} at Govindapally — the action is heating up.`;
   } catch (err) {
     console.error('Commentary error:', err.response?.data?.error || err.message);
     return `${snap.teamAName} face off against ${snap.teamBName} at Govindapally — the action is heating up.`;
@@ -196,12 +204,16 @@ export const calculateWinProbability = async (matchData, details = null) => {
   const baseline = baselineProbability(snap);
 
   // Past matches: skip the LLM entirely — baseline is already the truth.
-  if (snap.status === 'past') return baseline;
+  if (snap.status === 'past') return { ...baseline, source: 'final' };
 
   // No useful match state yet (toss done, no balls bowled): just hand back the
   // baseline rather than ask the LLM to hallucinate.
   if (!snap.aRuns && !snap.bRuns) {
-    return { ...baseline, analysis: snap.toss ? `${snap.toss}. Match underway.` : 'Match underway.' };
+    return {
+      ...baseline,
+      analysis: snap.toss ? `${snap.toss}. Match underway.` : 'Match underway.',
+      source: 'baseline',
+    };
   }
 
   const prompt = `You are a cricket analyst for the Govindpally Premier League (a tennis-ball village tournament where par run-rate is around 10).
@@ -221,18 +233,20 @@ Output a single JSON object on one line, nothing else:
 Probabilities must sum to 100.`;
 
   try {
-    const text = await callGateway(
+    const { content, finishReason, usedModel } = await callGateway(
       [{ role: 'user', content: prompt }],
-      { temperature: 0.3, maxTokens: 250 }, // jsonMode dropped — too unreliable across free models
+      { temperature: 0.3, maxTokens: 300 }, // jsonMode dropped — too unreliable across free models
     );
 
-    const parsed = safeJsonExtract(text);
+    const parsed = safeJsonExtract(content);
     if (!parsed
         || typeof parsed.team_a_pct !== 'number'
         || typeof parsed.team_b_pct !== 'number'
         || (parsed.team_a_pct + parsed.team_b_pct) === 0) {
-      console.warn('Probability: malformed LLM response, using baseline. raw:', String(text).slice(0, 200));
-      return baseline;
+      console.warn(
+        `Probability: malformed LLM response — model=${usedModel} finish=${finishReason} len=${content?.length}\nRaw: ${String(content).slice(0, 400)}`,
+      );
+      return { ...baseline, source: 'baseline-llm-malformed', model: usedModel || PRIMARY_MODEL };
     }
 
     // Normalise to 100 in case the model rounded.
@@ -244,9 +258,9 @@ Probabilities must sum to 100.`;
     if (typeof parsed.analysis !== 'string' || !parsed.analysis.trim()) {
       parsed.analysis = baseline.analysis;
     }
-    return parsed;
+    return { ...parsed, source: 'llm', model: usedModel || PRIMARY_MODEL };
   } catch (err) {
     console.error('Probability error:', err.response?.data?.error || err.message);
-    return baseline;
+    return { ...baseline, source: 'baseline-llm-error' };
   }
 };
