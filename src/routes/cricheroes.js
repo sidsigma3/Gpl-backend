@@ -271,6 +271,105 @@ router.get('/matches/:id/highlights', async (req, res) => {
   }
 });
 
+// Aggregated player stats (most runs / most wickets / best batting average / best
+// strike rate / best economy etc) computed live from ch_match_details_cache.
+router.get('/stats', async (req, res) => {
+  try {
+    const { tournamentId } = req.query;
+    let query = supabase.from('ch_match_details_cache').select('id, data, tournament_id');
+    if (tournamentId) query = query.eq('tournament_id', tournamentId);
+    const { data: rows, error } = await query;
+    if (error) throw error;
+
+    const batters = new Map(); // player_id -> { name, team_id, runs, balls, fours, sixes, innings, notOuts, highest, photo }
+    const bowlers = new Map(); // player_id -> { name, team_id, wickets, runs, overs (decimal), innings, photo }
+
+    const oversToDecimal = (s) => {
+      if (!s) return 0;
+      const [w, b] = String(s).split('.');
+      return (parseInt(w, 10) || 0) + ((parseInt(b || '0', 10) || 0) / 6);
+    };
+
+    for (const row of rows || []) {
+      const scorecard = row?.data?.scorecard?.scorecard || [];
+      for (const inning of scorecard) {
+        for (const b of inning.batting || []) {
+          if (!b?.player_id || !b.name) continue;
+          const key = String(b.player_id);
+          const cur = batters.get(key) || {
+            player_id: b.player_id, name: b.name, team_id: inning.team_id,
+            runs: 0, balls: 0, fours: 0, sixes: 0, innings: 0, not_outs: 0,
+            highest: 0, photo: b.profile_photo,
+          };
+          cur.runs += Number(b.runs) || 0;
+          cur.balls += Number(b.balls) || 0;
+          cur.fours += Number(b['4s']) || 0;
+          cur.sixes += Number(b['6s']) || 0;
+          cur.innings += 1;
+          if (b.how_to_out === 'not out') cur.not_outs += 1;
+          if ((Number(b.runs) || 0) > cur.highest) cur.highest = Number(b.runs) || 0;
+          if (!cur.photo && b.profile_photo) cur.photo = b.profile_photo;
+          batters.set(key, cur);
+        }
+        for (const bw of inning.bowling || []) {
+          if (!bw?.player_id || !bw.name) continue;
+          const key = String(bw.player_id);
+          const cur = bowlers.get(key) || {
+            player_id: bw.player_id, name: bw.name, team_id: inning.team_id,
+            wickets: 0, runs: 0, overs_decimal: 0, innings: 0, photo: bw.profile_photo,
+          };
+          cur.wickets += Number(bw.wickets) || 0;
+          cur.runs += Number(bw.runs) || 0;
+          cur.overs_decimal += oversToDecimal(bw.overs);
+          cur.innings += 1;
+          if (!cur.photo && bw.profile_photo) cur.photo = bw.profile_photo;
+          bowlers.set(key, cur);
+        }
+      }
+    }
+
+    const enrichedBatters = Array.from(batters.values()).map(b => ({
+      ...b,
+      strike_rate: b.balls > 0 ? +(b.runs / b.balls * 100).toFixed(2) : 0,
+      average: (b.innings - b.not_outs) > 0 ? +(b.runs / (b.innings - b.not_outs)).toFixed(2) : null,
+    }));
+    const enrichedBowlers = Array.from(bowlers.values()).map(b => ({
+      ...b,
+      overs: +b.overs_decimal.toFixed(1),
+      economy: b.overs_decimal > 0 ? +(b.runs / b.overs_decimal).toFixed(2) : 0,
+    }));
+
+    const TOP_N = 10;
+    const topRunScorers = [...enrichedBatters].sort((a, b) => b.runs - a.runs).slice(0, TOP_N);
+    const topWicketTakers = [...enrichedBowlers].sort((a, b) => b.wickets - a.wickets || a.economy - b.economy).slice(0, TOP_N);
+    const topStrikeRate = [...enrichedBatters]
+      .filter(b => b.balls >= 20) // qualifier
+      .sort((a, b) => b.strike_rate - a.strike_rate).slice(0, TOP_N);
+    const topBoundaries = [...enrichedBatters]
+      .map(b => ({ ...b, boundaries: b.fours + b.sixes }))
+      .sort((a, b) => b.boundaries - a.boundaries || b.sixes - a.sixes)
+      .slice(0, TOP_N);
+    const bestEconomy = [...enrichedBowlers]
+      .filter(b => b.overs_decimal >= 4) // qualifier
+      .sort((a, b) => a.economy - b.economy).slice(0, TOP_N);
+
+    res.json({
+      success: true,
+      data: {
+        most_runs: topRunScorers,
+        most_wickets: topWicketTakers,
+        best_strike_rate: topStrikeRate,
+        most_boundaries: topBoundaries,
+        best_economy: bestEconomy,
+      },
+      error: null,
+    });
+  } catch (error) {
+    console.error('Stats Error:', error.message);
+    res.status(500).json({ success: false, data: null, error: error.message });
+  }
+});
+
 // Get all tournaments
 router.get('/tournaments', async (req, res) => {
   try {
